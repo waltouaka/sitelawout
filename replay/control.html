@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Replay Control</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0e0e10; color: #eee; font: 15px system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 14px; display: flex; flex-direction: column; gap: 14px; }
+  .card { background: #18181b; border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  input[type=text], input[type=password] { flex: 1; min-width: 160px; padding: 10px; border-radius: 8px;
+    border: 1px solid #333; background: #1f1f23; color: #eee; }
+  button { padding: 10px 14px; border: 0; border-radius: 8px; background: #2f2f35; color: #eee; font-size: 15px; cursor: pointer; }
+  button:disabled { opacity: .35; cursor: default; }
+  button.on { background: #9147ff; }
+  .big { flex: 1; padding: 16px; font-size: 18px; font-weight: 700; }
+  .red { background: #e91916; } .purple { background: #9147ff; } .green { background: #00a35c; }
+  video { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 8px; }
+  .track { position: relative; height: 34px; background: #26262c; border-radius: 6px; cursor: pointer; }
+  .sel { position: absolute; top: 0; bottom: 0; background: rgba(145,71,255,.45); border-left: 3px solid #b88aff; border-right: 3px solid #b88aff; }
+  .head { position: absolute; top: -3px; bottom: -3px; width: 2px; background: #fff; }
+  .muted { opacity: .7; font-size: 13px; }
+  #status { font-size: 13px; opacity: .8; }
+  #editor { display: none; }
+  details summary { cursor: pointer; opacity: .8; }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <details id="setupBox">
+      <summary>Setup (one time)</summary>
+      <div class="row" style="margin-top:10px">
+        <input id="channel" type="text" placeholder="Twitch channel" value="akaoutlaw">
+        <button id="connect" class="purple">Save</button>
+      </div>
+      <div class="muted">Paste this as the URL of a Browser Source in OBS (1920×1080). Keep it secret — it's your remote.</div>
+      <div class="row">
+        <input id="playerUrl" type="text" readonly>
+        <button id="copy">Copy</button>
+      </div>
+      <div class="row muted">Player file location:
+        <input id="playerBase" type="text" placeholder="https://yoursite.github.io/replay-player.html">
+      </div>
+      <div class="row"><button id="newTopic">Make a new secret link</button></div>
+    </details>
+    <div id="status">Not connected</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="instant" class="big red" disabled>INSTANT REPLAY</button>
+      <button id="grab" class="big purple" disabled>GRAB &amp; EDIT</button>
+    </div>
+    <div class="row muted">
+      Grab last <select id="grabLen"><option>15</option><option selected>30</option><option>45</option><option>60</option></select> s
+      &nbsp;·&nbsp; buffer: <span id="buf">0</span>s
+      &nbsp;·&nbsp; <button id="stop" style="padding:4px 10px">Stop replay on stream</button>
+    </div>
+  </div>
+
+  <div class="card" id="editor">
+    <video id="vid" playsinline controls></video>
+    <div class="track" id="track"><div class="sel" id="sel"></div><div class="head" id="head"></div></div>
+    <div class="row">
+      <button id="setIn">[ Set start</button>
+      <button id="setOut">Set end ]</button>
+      <span class="muted" id="rangeTxt"></span>
+    </div>
+    <div class="row">
+      Speed:
+      <button class="spd" data-r="1">1x</button>
+      <button class="spd" data-r="0.75">0.75x</button>
+      <button class="spd" data-r="0.5">0.5x</button>
+      <button class="spd" data-r="0.25">0.25x</button>
+      <label class="muted"><input type="checkbox" id="mute"> mute audio</label>
+    </div>
+    <div class="row">
+      <button id="preview" class="big">▶ PREVIEW</button>
+      <button id="publish" class="big green" disabled>SEND TO STREAM</button>
+    </div>
+    <div class="muted">Tip: tap the bar to jump. Set start/end at the playhead. The clip must be sent within ~2 min of grabbing.</div>
+  </div>
+</main>
+<script>
+/* Replay controller: watches your Twitch stream, lets you grab, preview, trim and
+   slow down a clip, then tells the on-stream replay-player.html exactly what to play. */
+const $ = id => document.getElementById(id);
+const status = t => $('status').textContent = t;
+const log = t => { console.log(t); status(t); };
+$('channel').value = localStorage.getItem('rc_channel') || 'akaoutlaw';
+if (!localStorage.getItem('rc_seen')) { $('setupBox').open = true; localStorage.setItem('rc_seen', '1'); }
+
+
+/* ---------- Shared: watch a Twitch stream and keep a rolling buffer ----------
+   (pasted into both replay-player.html and control.html at build time) */
+const TWITCH_CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko'; // Twitch web player's public ID (unofficial)
+
+function makeWatcher(channel, keepSec, log) {
+  const w = { segments: [], mapBlob: null, seen: new Set(), live: false, noClock: false };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  async function playlistUrl() {
+    const gql = await fetch('https://gql.twitch.tv/gql', {
+      method: 'POST',
+      headers: { 'Client-ID': TWITCH_CLIENT_ID, 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: JSON.stringify({
+        operationName: 'PlaybackAccessToken_Template',
+        query: 'query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: "web", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isLive) { value signature __typename } videoPlaybackAccessToken(id: $vodID, params: {platform: "web", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isVod) { value signature __typename } }',
+        variables: { isLive: true, login: channel, isVod: false, vodID: '', playerType: 'embed' },
+      }),
+    }).then(r => r.json());
+    const tok = gql && gql.data && gql.data.streamPlaybackAccessToken;
+    if (!tok) throw new Error('no playback token: ' + JSON.stringify(gql).slice(0, 200));
+    const res = await fetch('https://usher.ttvnw.net/api/channel/hls/' + channel + '.m3u8?' + new URLSearchParams({
+      sig: tok.signature, token: tok.value, allow_source: 'true', fast_bread: 'true',
+      player_backend: 'mediaplayer', playlist_include_framerate: 'true', supported_codecs: 'avc1',
+      p: String(Math.floor(Math.random() * 1e7)),
+    }));
+    if (res.status === 404) throw new Error('offline');
+    const url = (await res.text()).split('\n').find(l => l.startsWith('https://')); // first = source quality
+    if (!url) throw new Error('no variant in master playlist');
+    return url;
+  }
+
+  async function poll(url) {
+    const text = await fetch(url).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); });
+    const lines = text.split('\n').map(l => l.trim());
+    const map = lines.find(l => l.startsWith('#EXT-X-MAP:'));
+    if (map && !w.mapBlob) w.mapBlob = await fetch(new URL(map.match(/URI="([^"]+)"/)[1], url)).then(r => r.blob());
+    let pdt = null;
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i];
+      if (l.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) { pdt = Date.parse(l.slice(25)); continue; }
+      if (!l.startsWith('#EXTINF:')) continue;
+      const [durStr, title = ''] = l.slice(8).split(',');
+      const dur = parseFloat(durStr), segUrl = lines[i + 1], thisPdt = pdt;
+      pdt = thisPdt != null ? thisPdt + dur * 1000 : null; // next segment's estimated clock time
+      if (!segUrl || segUrl.startsWith('#') || w.seen.has(segUrl)) continue;
+      w.seen.add(segUrl);
+      if (title !== 'live') continue; // skip ad segments
+      let clock = thisPdt;
+      if (clock == null) { // no clock tags from Twitch: estimate (pages may drift apart a little)
+        if (!w.noClock) { w.noClock = true; log('⚠ Twitch sent no clock times; using estimates'); }
+        const last = w.segments[w.segments.length - 1];
+        clock = last ? last.pdt + last.dur * 1000 : Date.now() - dur * 1000;
+      }
+      const blob = await fetch(new URL(segUrl, url)).then(r => r.blob());
+      w.segments.push({ url: segUrl, dur, pdt: clock, blob });
+    }
+    let total = w.segments.reduce((s, x) => s + x.dur, 0);
+    while (w.segments.length && total - w.segments[0].dur > keepSec) total -= w.segments.shift().dur;
+    if (w.seen.size > 800) { const keep = new Set(w.segments.map(s => s.url)); w.seen.forEach(u => keep.has(u) || w.seen.delete(u)); }
+  }
+
+  (async function loop() {
+    while (true) {
+      let url;
+      try { url = await playlistUrl(); w.live = true; log('Watching #' + channel + ' ✔'); }
+      catch (e) {
+        w.live = false;
+        log(e.message === 'offline' ? 'Stream offline — checking again in 15s'
+          : e instanceof TypeError ? '⚠ Twitch blocked the request from this page (CORS/network) — retrying in 15s'
+          : '⚠ ' + e.message + ' — retrying in 15s');
+        await sleep(15000); continue;
+      }
+      let fails = 0;
+      while (fails < 3) {
+        try { await poll(url); fails = 0; } catch (e) { fails++; log('⚠ playlist poll failed: ' + e.message); }
+        await sleep(1500);
+      }
+      w.live = false; log('Lost the stream playlist, reconnecting');
+    }
+  })();
+
+  // segments overlapping [startMs, endMs] (clock time)
+  w.range = (startMs, endMs) => w.segments.filter(s => s.pdt + s.dur * 1000 > startMs && s.pdt < endMs);
+  w.bufferedSec = () => w.segments.reduce((s, x) => s + x.dur, 0);
+  w.liveEdge = () => { const l = w.segments[w.segments.length - 1]; return l ? l.pdt + l.dur * 1000 : null; };
+  return w;
+}
+
+/* Turn saved segments into a playable playlist; returns { url, revoke } */
+function buildPlaylist(segs, mapBlob) {
+  const urls = segs.map(s => URL.createObjectURL(s.blob));
+  let m3u = '#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:'
+          + Math.ceil(Math.max(...segs.map(s => s.dur))) + '\n#EXT-X-MEDIA-SEQUENCE:0\n';
+  if (mapBlob) { const mu = URL.createObjectURL(mapBlob); urls.push(mu); m3u += `#EXT-X-MAP:URI="${mu}"\n`; }
+  segs.forEach((s, i) => m3u += `#EXTINF:${s.dur.toFixed(3)},\n${urls[i]}\n`);
+  m3u += '#EXT-X-ENDLIST\n';
+  const url = URL.createObjectURL(new Blob([m3u], { type: 'application/vnd.apple.mpegurl' }));
+  urls.push(url);
+  return { url, revoke: () => urls.forEach(u => URL.revokeObjectURL(u)) };
+}
+
+
+/* ---------- link to the player (ntfy.sh relay — nothing to install) ---------- */
+function randomTopic() {
+  const a = new Uint8Array(12); crypto.getRandomValues(a);
+  return 'aka-replay-' + Array.from(a, b => b.toString(16).padStart(2, '0')).join('');
+}
+let topic = localStorage.getItem('rc_topic') || randomTopic();
+localStorage.setItem('rc_topic', topic);
+const ready = true;
+function defaultPlayerBase() {
+  return location.protocol.startsWith('http') ? new URL('replay-player.html', location.href).href : '';
+}
+$('playerBase').value = localStorage.getItem('rc_base') || defaultPlayerBase();
+function showPlayerUrl() {
+  const base = $('playerBase').value.trim() || 'replay-player.html';
+  $('playerUrl').value = base + '?topic=' + topic + '&channel=' + encodeURIComponent($('channel').value.trim().toLowerCase());
+}
+$('playerBase').oninput = () => { localStorage.setItem('rc_base', $('playerBase').value.trim()); showPlayerUrl(); };
+$('channel').oninput = showPlayerUrl;
+$('copy').onclick = () => { $('playerUrl').select(); navigator.clipboard && navigator.clipboard.writeText($('playerUrl').value); status('Copied — paste it into an OBS Browser Source'); };
+$('newTopic').onclick = () => {
+  if (!confirm('Make a new link? You will need to update the URL in OBS.')) return;
+  topic = randomTopic(); localStorage.setItem('rc_topic', topic); showPlayerUrl();
+};
+showPlayerUrl();
+
+async function sendToPlayer(cmd) {
+  try {
+    const r = await fetch('https://ntfy.sh/' + encodeURIComponent(topic), {
+      method: 'POST', body: JSON.stringify(Object.assign({ sent: Date.now() }, cmd)) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return true;
+  } catch (e) { status('⚠ Could not reach the player: ' + e.message); return false; }
+}
+
+/* ---------- Twitch watcher ---------- */
+let watcher = null;
+function start() {
+  const ch = $('channel').value.trim().toLowerCase();
+  localStorage.setItem('rc_channel', ch);
+  showPlayerUrl();
+  if (!watcher) watcher = makeWatcher(ch, 150, t => { log(t); updateButtons(); });
+}
+$('connect').onclick = start;
+start();
+setInterval(() => { if (watcher) $('buf').textContent = Math.round(watcher.bufferedSec()); updateButtons(); }, 1000);
+function updateButtons() {
+  const has = watcher && watcher.segments.length > 0;
+  $('instant').disabled = !ready;
+  $('grab').disabled = !has;
+  $('publish').disabled = !ready || !clip;
+}
+
+/* ---------- Instant replay / stop ---------- */
+$('instant').onclick = async () => { if (await sendToPlayer({ type: 'replay', from: 'control panel' })) status('Instant replay sent ✔'); };
+$('stop').onclick = () => sendToPlayer({ type: 'stop' });
+
+/* ---------- Grab & edit ---------- */
+const vid = $('vid');
+let hls = null, pl = null, clip = null; // clip: { base (clock ms of t=0), dur, inT, outT }
+let rate = 1, previewing = false;
+
+$('grab').onclick = () => {
+  const len = +$('grabLen').value;
+  const end = watcher.liveEdge(), startMs = end - len * 1000;
+  const segs = watcher.range(startMs, end);
+  if (!segs.length) return status('Nothing buffered yet');
+  if (hls) hls.destroy(); if (pl) pl.revoke();
+  pl = buildPlaylist(segs, watcher.mapBlob);
+  const dur = segs.reduce((s, x) => s + x.dur, 0);
+  clip = { base: segs[0].pdt, dur, inT: Math.max(0, dur - 15), outT: dur };
+  hls = new Hls(); hls.loadSource(pl.url); hls.attachMedia(vid);
+  hls.on(Hls.Events.MANIFEST_PARSED, () => { vid.currentTime = clip.inT; drawTrack(); });
+  $('editor').style.display = 'flex';
+  status(`Grabbed ${dur.toFixed(0)}s — trim it, preview, then send`);
+  updateButtons();
+};
+
+function fmt(t) { return t.toFixed(1) + 's'; }
+function drawTrack() {
+  if (!clip) return;
+  const p = x => (x / clip.dur * 100) + '%';
+  $('sel').style.left = p(clip.inT);
+  $('sel').style.width = ((clip.outT - clip.inT) / clip.dur * 100) + '%';
+  $('head').style.left = p(Math.min(vid.currentTime || 0, clip.dur));
+  const len = clip.outT - clip.inT;
+  $('rangeTxt').textContent = `${fmt(clip.inT)} → ${fmt(clip.outT)}  (${fmt(len)}, plays ${fmt(len / rate)} on stream)`;
+}
+vid.addEventListener('timeupdate', () => {
+  drawTrack();
+  if (previewing && vid.currentTime >= clip.outT) { vid.pause(); previewing = false; vid.currentTime = clip.inT; }
+});
+$('track').onclick = e => {
+  if (!clip) return;
+  const r = $('track').getBoundingClientRect();
+  vid.currentTime = (e.clientX - r.left) / r.width * clip.dur; drawTrack();
+};
+$('setIn').onclick = () => { clip.inT = Math.min(vid.currentTime, clip.outT - 0.5); drawTrack(); };
+$('setOut').onclick = () => { clip.outT = Math.max(vid.currentTime, clip.inT + 0.5); drawTrack(); };
+document.querySelectorAll('.spd').forEach(b => b.onclick = () => {
+  rate = +b.dataset.r; vid.playbackRate = rate;
+  document.querySelectorAll('.spd').forEach(x => x.classList.toggle('on', x === b)); drawTrack();
+});
+document.querySelector('.spd[data-r="1"]').classList.add('on');
+$('preview').onclick = () => {
+  vid.currentTime = clip.inT; vid.playbackRate = rate; vid.muted = $('mute').checked;
+  previewing = true; vid.play();
+};
+$('publish').onclick = async () => {
+  const data = { type: 'replay', from: 'control panel', start: Math.round(clip.base + clip.inT * 1000),
+                 end: Math.round(clip.base + clip.outT * 1000), rate, muted: $('mute').checked };
+  if (!(await sendToPlayer(data))) return;
+  status(`Sent ${fmt(clip.outT - clip.inT)} at ${rate}x to stream ✔`);
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>akaoutlaw replay player</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background: transparent; overflow: hidden; }
+  /* Invisible until a replay plays */
+  #wrap { position: absolute; inset: 0; opacity: 0; transition: opacity .35s; }
+  #wrap.on { opacity: 1; }
+  video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #tag { position: absolute; top: 4%; left: 4%; padding: .3em .8em; background: #e91916; color: #fff;
+         font: 800 clamp(18px, 3vw, 48px) system-ui, sans-serif; letter-spacing: .08em; }
+  #tag small { font-size: .55em; margin-left: .5em; opacity: .85; }
+  #log { position: absolute; bottom: 0; left: 0; right: 0; max-height: 40%; overflow: hidden; display: none;
+         padding: 8px; background: rgba(0,0,0,.75); color: #0f0; font: 13px monospace; white-space: pre-wrap; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+</head>
+<body>
+<div id="wrap"><video id="vid" playsinline></video><div id="tag">REPLAY<small id="speed"></small></div></div>
+<div id="log"></div>
+<script>
+/* =====================================================================
+   REPLAY PLAYER — browser source that watches your Twitch stream, keeps
+   the last ~2 minutes, and plays a replay when told to. Invisible otherwise.
+   Works in normal OBS and IRLToolkit cloud OBS.
+
+   Triggers:
+     • control.html  (edited clip or instant replay) — linked by &topic= (no OBS websocket needed)
+     • "!replay" in Twitch chat from you or a mod (instant, last N seconds)
+     • R key when testing in a normal browser tab
+   URL options: ?topic=YOUR-SECRET&channel=akaoutlaw&clip=15&wait=4&cd=10&keep=120&mods=1&cmd=!replay&debug=1
+   ===================================================================== */
+const q = new URLSearchParams(location.search);
+const CFG = {
+  channel: (q.get('channel') || 'akaoutlaw').toLowerCase(),
+  clipSec: +(q.get('clip') || 15),
+  waitSec: +(q.get('wait') || 4),
+  cooldownSec: +(q.get('cd') || 10),
+  keepSec: +(q.get('keep') || 120),  // must be longer than you spend editing in the controller
+  modsOnly: q.get('mods') !== '0',
+  command: (q.get('cmd') || '!replay').toLowerCase(),
+};
+const logEl = document.getElementById('log');
+if (q.get('debug') === '1') logEl.style.display = 'block';
+function log(...a) {
+  const line = new Date().toLocaleTimeString() + '  ' + a.join(' ');
+  console.log(line); logEl.textContent = (line + '\n' + logEl.textContent).slice(0, 3000);
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* ---------- Shared: watch a Twitch stream and keep a rolling buffer ----------
+   (pasted into both replay-player.html and control.html at build time) */
+const TWITCH_CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko'; // Twitch web player's public ID (unofficial)
+
+function makeWatcher(channel, keepSec, log) {
+  const w = { segments: [], mapBlob: null, seen: new Set(), live: false, noClock: false };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  async function playlistUrl() {
+    const gql = await fetch('https://gql.twitch.tv/gql', {
+      method: 'POST',
+      headers: { 'Client-ID': TWITCH_CLIENT_ID, 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: JSON.stringify({
+        operationName: 'PlaybackAccessToken_Template',
+        query: 'query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: "web", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isLive) { value signature __typename } videoPlaybackAccessToken(id: $vodID, params: {platform: "web", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isVod) { value signature __typename } }',
+        variables: { isLive: true, login: channel, isVod: false, vodID: '', playerType: 'embed' },
+      }),
+    }).then(r => r.json());
+    const tok = gql && gql.data && gql.data.streamPlaybackAccessToken;
+    if (!tok) throw new Error('no playback token: ' + JSON.stringify(gql).slice(0, 200));
+    const res = await fetch('https://usher.ttvnw.net/api/channel/hls/' + channel + '.m3u8?' + new URLSearchParams({
+      sig: tok.signature, token: tok.value, allow_source: 'true', fast_bread: 'true',
+      player_backend: 'mediaplayer', playlist_include_framerate: 'true', supported_codecs: 'avc1',
+      p: String(Math.floor(Math.random() * 1e7)),
+    }));
+    if (res.status === 404) throw new Error('offline');
+    const url = (await res.text()).split('\n').find(l => l.startsWith('https://')); // first = source quality
+    if (!url) throw new Error('no variant in master playlist');
+    return url;
+  }
+
+  async function poll(url) {
+    const text = await fetch(url).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); });
+    const lines = text.split('\n').map(l => l.trim());
+    const map = lines.find(l => l.startsWith('#EXT-X-MAP:'));
+    if (map && !w.mapBlob) w.mapBlob = await fetch(new URL(map.match(/URI="([^"]+)"/)[1], url)).then(r => r.blob());
+    let pdt = null;
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i];
+      if (l.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) { pdt = Date.parse(l.slice(25)); continue; }
+      if (!l.startsWith('#EXTINF:')) continue;
+      const [durStr, title = ''] = l.slice(8).split(',');
+      const dur = parseFloat(durStr), segUrl = lines[i + 1], thisPdt = pdt;
+      pdt = thisPdt != null ? thisPdt + dur * 1000 : null; // next segment's estimated clock time
+      if (!segUrl || segUrl.startsWith('#') || w.seen.has(segUrl)) continue;
+      w.seen.add(segUrl);
+      if (title !== 'live') continue; // skip ad segments
+      let clock = thisPdt;
+      if (clock == null) { // no clock tags from Twitch: estimate (pages may drift apart a little)
+        if (!w.noClock) { w.noClock = true; log('⚠ Twitch sent no clock times; using estimates'); }
+        const last = w.segments[w.segments.length - 1];
+        clock = last ? last.pdt + last.dur * 1000 : Date.now() - dur * 1000;
+      }
+      const blob = await fetch(new URL(segUrl, url)).then(r => r.blob());
+      w.segments.push({ url: segUrl, dur, pdt: clock, blob });
+    }
+    let total = w.segments.reduce((s, x) => s + x.dur, 0);
+    while (w.segments.length && total - w.segments[0].dur > keepSec) total -= w.segments.shift().dur;
+    if (w.seen.size > 800) { const keep = new Set(w.segments.map(s => s.url)); w.seen.forEach(u => keep.has(u) || w.seen.delete(u)); }
+  }
+
+  (async function loop() {
+    while (true) {
+      let url;
+      try { url = await playlistUrl(); w.live = true; log('Watching #' + channel + ' ✔'); }
+      catch (e) {
+        w.live = false;
+        log(e.message === 'offline' ? 'Stream offline — checking again in 15s'
+          : e instanceof TypeError ? '⚠ Twitch blocked the request from this page (CORS/network) — retrying in 15s'
+          : '⚠ ' + e.message + ' — retrying in 15s');
+        await sleep(15000); continue;
+      }
+      let fails = 0;
+      while (fails < 3) {
+        try { await poll(url); fails = 0; } catch (e) { fails++; log('⚠ playlist poll failed: ' + e.message); }
+        await sleep(1500);
+      }
+      w.live = false; log('Lost the stream playlist, reconnecting');
+    }
+  })();
+
+  // segments overlapping [startMs, endMs] (clock time)
+  w.range = (startMs, endMs) => w.segments.filter(s => s.pdt + s.dur * 1000 > startMs && s.pdt < endMs);
+  w.bufferedSec = () => w.segments.reduce((s, x) => s + x.dur, 0);
+  w.liveEdge = () => { const l = w.segments[w.segments.length - 1]; return l ? l.pdt + l.dur * 1000 : null; };
+  return w;
+}
+
+/* Turn saved segments into a playable playlist; returns { url, revoke } */
+function buildPlaylist(segs, mapBlob) {
+  const urls = segs.map(s => URL.createObjectURL(s.blob));
+  let m3u = '#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:'
+          + Math.ceil(Math.max(...segs.map(s => s.dur))) + '\n#EXT-X-MEDIA-SEQUENCE:0\n';
+  if (mapBlob) { const mu = URL.createObjectURL(mapBlob); urls.push(mu); m3u += `#EXT-X-MAP:URI="${mu}"\n`; }
+  segs.forEach((s, i) => m3u += `#EXTINF:${s.dur.toFixed(3)},\n${urls[i]}\n`);
+  m3u += '#EXT-X-ENDLIST\n';
+  const url = URL.createObjectURL(new Blob([m3u], { type: 'application/vnd.apple.mpegurl' }));
+  urls.push(url);
+  return { url, revoke: () => urls.forEach(u => URL.revokeObjectURL(u)) };
+}
+
+
+const watcher = makeWatcher(CFG.channel, CFG.keepSec, log);
+
+/* ---------- play a clip ---------- */
+const wrap = document.getElementById('wrap'), vid = document.getElementById('vid');
+let busy = false, lastAt = 0, hls = null, pl = null, stopAt = Infinity, safety = null;
+
+// req: { start, end } in clock ms (from controller), or nothing for "last N seconds"; plus rate, muted, from
+async function playReplay(req = {}) {
+  if (busy) return log('Ignored (already playing)');
+  if (!req.start && Date.now() - lastAt < CFG.cooldownSec * 1000) return log('Ignored (cooldown)');
+  busy = true; lastAt = Date.now();
+  log('Replay requested by', req.from || '?');
+
+  let start = req.start, end = req.end;
+  if (!start || !end) {
+    await sleep(CFG.waitSec * 1000);
+    end = watcher.liveEdge();
+    if (!end) { log('⚠ Nothing buffered yet'); busy = false; return; }
+    start = end - (req.length || CFG.clipSec) * 1000;
+  }
+  const segs = watcher.range(start, end);
+  if (!segs.length) { log('⚠ That part of the stream is no longer in the buffer (raise &keep=)'); busy = false; return; }
+
+  const rate = Math.min(Math.max(+req.rate || 1, 0.1), 2);
+  const offset = Math.max(0, (start - segs[0].pdt) / 1000);
+  stopAt = (end - segs[0].pdt) / 1000;
+  pl = buildPlaylist(segs, watcher.mapBlob);
+  hls = new Hls({ enableWorker: true });
+  hls.loadSource(pl.url);
+  hls.attachMedia(vid);
+  hls.on(Hls.Events.MANIFEST_PARSED, () => {
+    vid.currentTime = offset;
+    vid.playbackRate = rate;
+    vid.muted = !!req.muted;
+    document.getElementById('speed').textContent = rate !== 1 ? (rate + 'x') : '';
+    vid.play().then(() => {
+      vid.playbackRate = rate; wrap.classList.add('on');
+      log(`Playing ${((end - start) / 1000).toFixed(1)}s at ${rate}x`);
+    }).catch(e => { log('⚠ play failed:', e.message); endReplay(); });
+  });
+  hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) { log('⚠ player error:', d.details); endReplay(); } });
+  safety = setTimeout(() => busy && endReplay(), ((end - start) / 1000 / rate + 15) * 1000);
+}
+
+vid.addEventListener('timeupdate', () => { if (busy && vid.currentTime >= stopAt) endReplay(); });
+vid.addEventListener('ended', () => busy && endReplay());
+function endReplay() {
+  clearTimeout(safety); stopAt = Infinity;
+  wrap.classList.remove('on');
+  setTimeout(() => {
+    if (hls) { hls.destroy(); hls = null; }
+    vid.pause(); vid.removeAttribute('src'); vid.load();
+    if (pl) { pl.revoke(); pl = null; }
+    busy = false; log('Replay finished');
+  }, 400);
+}
+
+/* ---------- triggers ---------- */
+// from control.html, through ntfy.sh (free relay, no account). The topic is your secret link.
+function connectRelay() {
+  const topic = q.get('topic');
+  if (!topic) return log('⚠ No &topic= in the URL — control panel won\'t reach this player (chat command still works)');
+  const es = new EventSource('https://ntfy.sh/' + encodeURIComponent(topic) + '/sse');
+  es.onopen = () => log('Control panel link ready ✔');
+  es.onmessage = e => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.event !== 'message') return;
+      const cmd = JSON.parse(msg.message);
+      if (Date.now() - (cmd.sent || 0) > 30000) return; // ignore old/stale commands
+      if (cmd.type === 'stop') { if (busy) endReplay(); }
+      else if (cmd.type === 'replay') playReplay(cmd);
+    } catch (err) { log('⚠ bad control message'); }
+  };
+  es.onerror = () => log('Control link dropped, reconnecting...'); // EventSource retries by itself
+}
+connectRelay();
+window.addEventListener('keydown', e => e.key.toLowerCase() === 'r' && playReplay({ from: 'keyboard' }));
+
+function connectChat() {
+  const ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+  ws.onopen = () => {
+    ws.send('CAP REQ :twitch.tv/tags'); ws.send('PASS SCHMOOPIIE');
+    ws.send('NICK justinfan' + Math.floor(10000 + Math.random() * 80000));
+    ws.send('JOIN #' + CFG.channel);
+  };
+  ws.onmessage = ev => {
+    for (const line of ev.data.split('\r\n')) {
+      if (line.startsWith('PING')) { ws.send('PONG :tmi.twitch.tv'); continue; }
+      const m = line.match(/^@(\S+) :(\w+)!\S+ PRIVMSG #\w+ :(.*)$/);
+      if (!m || m[3].trim().split(/\s+/)[0].toLowerCase() !== CFG.command) continue;
+      const tags = Object.fromEntries(m[1].split(';').map(t => t.split('=')));
+      const ok = !CFG.modsOnly || /broadcaster|moderator/.test(tags.badges || '');
+      ok ? playReplay({ from: tags['display-name'] || m[2] }) : log('Ignored', m[2], '(not a mod)');
+    }
+  };
+  ws.onclose = () => setTimeout(connectChat, 5000);
+}
+
+if (typeof Hls === 'undefined' || !Hls.isSupported()) log('⚠ hls.js failed to load');
+connectChat();
+</script>
+</body>
+</html>
