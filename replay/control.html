@@ -202,7 +202,7 @@ function randomTopic() {
   const a = new Uint8Array(12); crypto.getRandomValues(a);
   return 'aka-replay-' + Array.from(a, b => b.toString(16).padStart(2, '0')).join('');
 }
-let topic = localStorage.getItem('rc_topic') || randomTopic();
+let topic = new URLSearchParams(location.search).get('topic') || localStorage.getItem('rc_topic') || randomTopic();
 localStorage.setItem('rc_topic', topic);
 const ready = true;
 function defaultPlayerBase() {
