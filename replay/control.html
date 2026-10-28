@@ -31,23 +31,24 @@
 <body>
 <main>
   <div class="card">
+    <b>OBS Browser Source link</b>
+    <div class="muted">Add a Browser Source in OBS (Width 1920, Height 1080) and paste this as its URL. Keep it private, it's your remote.</div>
+    <div class="row">
+      <input id="playerUrl" type="text" readonly onclick="this.select()">
+      <button id="copy" class="purple">Copy</button>
+    </div>
     <details id="setupBox">
-      <summary>Setup (one time)</summary>
+      <summary>Settings</summary>
       <div class="row" style="margin-top:10px">
-        <input id="channel" type="text" placeholder="Twitch channel" value="akaoutlaw">
-        <button id="connect" class="purple">Save</button>
-      </div>
-      <div class="muted">Paste this as the URL of a Browser Source in OBS (1920×1080). Keep it secret — it's your remote.</div>
-      <div class="row">
-        <input id="playerUrl" type="text" readonly>
-        <button id="copy">Copy</button>
+        Twitch channel: <input id="channel" type="text" value="akaoutlaw">
+        <button id="connect">Save</button>
       </div>
       <div class="row muted">Player file location:
         <input id="playerBase" type="text" placeholder="https://yoursite.github.io/replay-player.html">
       </div>
       <div class="row"><button id="newTopic">Make a new secret link</button></div>
     </details>
-    <div id="status">Not connected</div>
+    <div id="status">Starting...</div>
   </div>
 
   <div class="card">
@@ -92,7 +93,6 @@ const $ = id => document.getElementById(id);
 const status = t => $('status').textContent = t;
 const log = t => { console.log(t); status(t); };
 $('channel').value = localStorage.getItem('rc_channel') || 'akaoutlaw';
-if (!localStorage.getItem('rc_seen')) { $('setupBox').open = true; localStorage.setItem('rc_seen', '1'); }
 
 
 /* ---------- Shared: watch a Twitch stream and keep a rolling buffer ----------
